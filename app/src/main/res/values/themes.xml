@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.GestaMercado" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:statusBarColor">@color/ink</item>
+        <item name="android:navigationBarColor">#FFFFFFFF</item>
+    </style>
+</resources>
