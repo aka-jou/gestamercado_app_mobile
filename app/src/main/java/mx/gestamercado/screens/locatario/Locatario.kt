@@ -23,23 +23,34 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.ui.platform.LocalContext
+import kotlinx.coroutines.launch
 import mx.gestamercado.LocalApp
+import mx.gestamercado.LocalBackend
 import mx.gestamercado.LocalNav
 import mx.gestamercado.LocalToast
 import mx.gestamercado.Route
 import mx.gestamercado.data.Cargo
+import mx.gestamercado.data.Documentos
+import mx.gestamercado.data.Remoto
 import mx.gestamercado.ui.*
 import mx.gestamercado.util.*
 import kotlin.math.max
 
-const val LOCAL_LOCATARIO = "A-08"
-
 @Composable
 fun LocatarioShell() {
     val app = LocalApp.current
+    val backend = LocalBackend.current
+    val toast = LocalToast.current
+    // M-L3 / M-L4 · adeudos, saldo a favor, cargos y pagos del local seleccionado
+    LaunchedEffect(app.localLocatario) {
+        runCatching { Remoto.cargarCuenta(app, backend, app.localLocatario) }.onFailure { toast(it.message ?: "No se pudo actualizar el estado de cuenta.") }
+    }
     Column(Modifier.fillMaxSize()) {
         Box(Modifier.weight(1f)) {
-            when (app.locTab) {
+            if (app.miLocal == null) SinLocales()
+            else when (app.locTab) {
                 0 -> MiLocalScreen { app.locTab = 1 }
                 1 -> EstadoCuentaScreen()
                 2 -> SimuladorScreen()
@@ -50,13 +61,45 @@ fun LocatarioShell() {
     }
 }
 
-/** Vista 2.2.A · Dashboard principal / tarjetón digital QR. */
+@Composable
+private fun SinLocales() {
+    val app = LocalApp.current
+    val nav = LocalNav.current
+    Column(Modifier.fillMaxSize()) {
+        SimpleBar("GET /api/v1/locales", "Mis locales")
+        Column(Modifier.padding(24.dp)) {
+            Notice("Tu cuenta no tiene locales concesionados ni como suplente. Acude a la Dirección de Mercados.", tone = Tone.WARN)
+            VSpace(16)
+            GhostButton("Cerrar sesión", { app.cerrarSesion(); nav.resetTo(Route.Login) })
+        }
+    }
+}
+
+/** Selector de local cuando el locatario es titular o suplente de varios. */
+@Composable
+private fun SelectorLocal() {
+    val app = LocalApp.current
+    if (app.misLocales.size < 2) return
+    Row(Modifier.fillMaxWidth().background(Color.White).borderBottom().horizontalScroll(rememberScrollState()).padding(16.dp, 10.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        app.misLocales.forEach { m -> SelectChip("${m.localId} · ${m.relacion.substringBefore(" ·")}", app.localLocatario == m.localId) { app.localLocatario = m.localId } }
+    }
+}
+
+/** Vista M-L2 · «Mis locales y mi concesión»: tarjetón QR, ficha, concesión y cédula PDF. */
 @Composable
 fun MiLocalScreen(onGoCuenta: () -> Unit) {
     val app = LocalApp.current
+    val nav = LocalNav.current
     val toast = LocalToast.current
-    val l = app.local(LOCAL_LOCATARIO)
+    val backend = LocalBackend.current
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val l = app.miLocal ?: return
+    val relacion = app.misLocales.firstOrNull { it.localId == l.id }?.relacion ?: "TITULAR"
     val adeudo = app.adeudo(l.id)
+    fun cedula(compartir: Boolean) = scope.launch {
+        runCatching { Documentos.cedula(ctx, backend, l, compartir) }.onFailure { toast(it.message ?: "No se pudo obtener la cédula.") }
+    }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         Box(Modifier.fillMaxWidth().background(C.Ink).clipToBounds().statusBarsPadding().padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 22.dp)) {
@@ -66,16 +109,26 @@ fun MiLocalScreen(onGoCuenta: () -> Unit) {
                     Mark(30.dp)
                     HSpace(12)
                     Column(Modifier.weight(1f)) {
-                        Text("HOLA, MARÍA GUADALUPE", style = label(C.Muted, 10))
+                        Text("HOLA, ${app.nombre.split(" ").take(2).joinToString(" ").uppercase()}", style = label(C.Muted, 10), maxLines = 1)
                         VSpace(2)
-                        Text("Mi local", style = sans(17, FontWeight.Bold, Color.White))
+                        Text(if (app.misLocales.size > 1) "Mis locales" else "Mi local", style = sans(17, FontWeight.Bold, Color.White))
                     }
-                    Avatar("MG", C.Magenta)
+                    BarAction("Salir") { app.cerrarSesion(); nav.resetTo(Route.Login) }
+                    HSpace(8)
+                    Avatar(app.iniciales, C.Magenta)
+                }
+                if (app.misLocales.size > 1) {
+                    VSpace(14)
+                    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        app.misLocales.forEach { m ->
+                            StatusChip(m.localId, m.relacion.substringBefore(" ·"), if (m.localId == l.id) C.Magenta else C.Muted, hollow = m.localId != l.id) { app.localLocatario = m.localId }
+                        }
+                    }
                 }
                 VSpace(16)
                 BoxCard(padding = PaddingValues(18.dp)) {
                     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-                        QrCode("GM-TARJETON|${l.id}|${l.tarjeton}|c4b1e9a2-71d0-4f3a-a8e5-0187a08mp01", 190.dp)
+                        QrCode("GM-TARJETON|${l.id}|${l.tarjeton}|${l.apiId}", 190.dp)
                         VSpace(12)
                         Text("${l.tarjeton} · ${l.id}", style = mono(22, FontWeight.Medium))
                         VSpace(4)
@@ -101,13 +154,13 @@ fun MiLocalScreen(onGoCuenta: () -> Unit) {
                         listOf(Triple(8, 20, false), Triple(46, 20, true), Triple(88, 20, false), Triple(8, 96, false), Triple(46, 96, false), Triple(88, 96, false)).forEach { (x, y, me) ->
                             Box(Modifier.offset(x.dp, y.dp).size(if (me) 38.dp else 34.dp, 52.dp).background(if (me) C.Magenta else C.GrayTint).border(if (me) 1.5.dp else 1.dp, C.Ink))
                         }
-                        Text("PASILLO A", style = label(C.Muted2, 8.5), modifier = Modifier.offset(8.dp, 78.dp))
+                        Text(l.zona.substringBefore(" · ").uppercase(), style = label(C.Muted2, 8.5), modifier = Modifier.offset(8.dp, 78.dp))
                     }
                     Box(Modifier.width(1.5.dp).fillMaxHeight().background(C.Ink))
                     Column(Modifier.weight(1f).padding(14.dp, 12.dp)) {
                         Text(l.nombre, style = sans(16, FontWeight.ExtraBold, lh = 1.15))
                         VSpace(6)
-                        Text("Mercado Poniente · ${l.zona.substringBefore(" · ")} · Local ${l.id}", style = sans(12, color = C.Body, lh = 1.4))
+                        Text("${app.mercadoNombre.substringBefore(" · ")} · ${l.zona.substringBefore(" · ")} · Local ${l.id}", style = sans(12, color = C.Body, lh = 1.4))
                         VSpace(8)
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             Tag(l.tipo)
@@ -123,14 +176,23 @@ fun MiLocalScreen(onGoCuenta: () -> Unit) {
             VSpace(18)
             SectionTitle("CONCESIÓN") { Tag(l.concesion, C.TealDark) }
             VSpace(10)
-            BoxCard(padding = PaddingValues(horizontal = 14.dp, vertical = 2.dp)) {
-                KV("Titular", l.titular)
-                KV("CURP", "HEOG780412MPLRRD05", monoV = true)
-                KV("RFC", "HEOG780412KJ3", monoV = true)
-                KV("Giro autorizado", l.giroAutorizado)
-                KV("Expediente", "DM/CON/2019/0187", monoV = true)
-                KV("Vigencia", "01 mar 2019 – 28 feb 2029", monoV = true, last = true)
+            if (relacion != "TITULAR") {
+                Notice("Consultas este local como $relacion del titular.", tone = Tone.INFO)
+                VSpace(8)
             }
+            BoxCard(padding = PaddingValues(horizontal = 14.dp, vertical = 2.dp)) {
+                KV("Concesión", l.concesionId ?: "—", monoV = true)
+                KV("Titular", l.titular)
+                l.curpTitular?.let { KV("CURP", it, monoV = true) }
+                l.rfcTitular?.let { KV("RFC", it, monoV = true) }
+                KV("Giro autorizado", l.giroAutorizado)
+                KV("Expediente", l.expediente ?: "—", monoV = true)
+                KV("Vigencia", l.vigencia ?: "—", monoV = true, last = true)
+            }
+            VSpace(10)
+            PrimaryButton("Cédula de concesión PDF con QR", if (l.concesionId != null) ({ cedula(false) }) else null, color = C.Ink)
+            VSpace(8)
+            GhostButton("Compartir cédula", if (l.concesionId != null) ({ cedula(true) }) else null)
             VSpace(18)
             SectionTitle("SUPLENTES · RN-PAD-02") { Text("${l.suplentes.size} / 2", style = mono(11, color = C.Muted2)) }
             VSpace(10)
@@ -145,37 +207,15 @@ fun MiLocalScreen(onGoCuenta: () -> Unit) {
                     }
                 }
             }
-            VSpace(18)
-            SectionTitle("EXPEDIENTE DIGITAL")
-            VSpace(10)
-            BoxCard {
-                listOf(
-                    Triple("CONTRATO", "contrato_concesion_A08.pdf", "PDF · 412 KB · 01 mar 2019"),
-                    Triple("DICTAMEN", "dictamen_PC_2025.pdf", "PDF · 1.2 MB · 14 ene 2025"),
-                    Triple("IDENTIFICACIÓN", "ine_titular.pdf", "PDF · 680 KB · 01 mar 2019"),
-                ).forEach { (t, n, s) ->
-                    Row(Modifier.fillMaxWidth().clickable { toast("Descargando $n…") }.borderBottom(1.dp, C.Line).padding(14.dp, 11.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text(t, style = label(C.TealDark, 10), modifier = Modifier.width(92.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text(n, style = mono(12.5), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            VSpace(2)
-                            Text(s, style = sans(11, color = C.Muted))
-                        }
-                        Box(Modifier.size(32.dp).border(1.5.dp, C.Ink), contentAlignment = Alignment.Center) {
-                            Icon(Icons.Filled.KeyboardArrowDown, contentDescription = "Descargar", tint = C.Ink, modifier = Modifier.size(18.dp))
-                        }
-                    }
-                }
-            }
         }
     }
 }
 
-/** Vista 2.3.A · Estado de cuenta y desglose de adeudos (CU-22). */
+/** Vista M-L3 · «Mi estado de cuenta y adeudos» (reportes-fiscales/adeudos, saldo-favor, cargos). */
 @Composable
 fun EstadoCuentaScreen() {
     val app = LocalApp.current
-    val l = app.local(LOCAL_LOCATARIO)
+    val l = app.miLocal ?: return
     var filtro by remember { mutableStateOf<String?>(null) }
     val cargos = app.cargosDe(l.id).reversed()
     val adeudo = app.adeudo(l.id)
@@ -185,7 +225,8 @@ fun EstadoCuentaScreen() {
     val estados = listOf("PENDIENTE", "PARCIAL", "PAGADO", "CANCELADO")
 
     Column(Modifier.fillMaxSize()) {
-        SimpleBar("${l.id} · ${l.nombre.uppercase()}", "Estado de cuenta", avatar = "MG")
+        SimpleBar("${l.id} · ${l.nombre.uppercase()}", "Estado de cuenta", avatar = app.iniciales)
+        SelectorLocal()
         Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(16.dp)) {
             if (adeudo > 0) HeroAmount("SALDO TOTAL ADEUDADO", money(adeudo), "${app.vencidos(l.id)} cargos vencidos" + if (desde != null) " · adeudo desde $desde 2026" else "")
             else HeroAmount("SALDO TOTAL ADEUDADO", money(0.0), "Estás al corriente. ¡Gracias!", C.TealDark)
@@ -197,9 +238,10 @@ fun EstadoCuentaScreen() {
                         VSpace(3)
                         Text("Se aplica solo por FIFO al siguiente cargo (CU-17).", style = sans(11.5, color = C.Muted2, lh = 1.4))
                     }
-                    Text(money(0.0), style = mono(20))
+                    Text(money(app.saldoFavor(l.id)), style = mono(20, color = if (app.saldoFavor(l.id) > 0) C.TealDark else C.Ink))
                 }
             }
+            if (app.simulado && l.id == "A-08") {
             VSpace(12)
             Column(Modifier.fillMaxWidth().background(C.YellowTint).border(1.5.dp, C.Ink).padding(15.dp, 13.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -214,6 +256,7 @@ fun EstadoCuentaScreen() {
                 }
                 VSpace(9)
                 Text("Al 5.º incumplimiento se revoca el pago diario y se genera una PENALIZACIÓN por el mes completo vencido.", style = sans(12, color = C.Body, lh = 1.45))
+            }
             }
             VSpace(14)
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -295,7 +338,7 @@ fun SimuladorScreen() {
     )
 
     Column(Modifier.fillMaxSize()) {
-        SimpleBar("fn_calcular_cuota · LEY DE INGRESOS", "¿Cuánto debo pagar?", avatar = "MG")
+        SimpleBar("fn_calcular_cuota · LEY DE INGRESOS", "¿Cuánto debo pagar?", avatar = LocalApp.current.iniciales)
         Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(16.dp)) {
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Column(Modifier.weight(1f)) {
@@ -393,15 +436,16 @@ fun SimuladorScreen() {
     }
 }
 
-/** Vista 2.5.A · Bóveda de comprobantes (pago + pago_detalle). */
+/** Vista M-L4 · «Mis pagos y recibos oficiales QR» (GET /api/v1/cobranza/local/{localId}). */
 @Composable
 fun RecibosScreen() {
     val app = LocalApp.current
     val nav = LocalNav.current
-    val list = app.pagosDe(LOCAL_LOCATARIO)
+    val list = app.pagosDe(app.localLocatario)
     val total = list.filter { !it.cancelado }.sumOf { it.monto }
     Column(Modifier.fillMaxSize()) {
-        SimpleBar("pago · fecha_pago DESC", "Mis recibos", avatar = "MG")
+        SimpleBar("cobranza/local · ${app.localLocatario}", "Mis recibos", avatar = app.iniciales)
+        SelectorLocal()
         Box(Modifier.background(Color.White).borderBottom()) {
             MetricRow(border = false) {
                 MetricCell("PAGADO EN 2026", money(total), Modifier.weight(1f).fillMaxHeight(), vs = 18)

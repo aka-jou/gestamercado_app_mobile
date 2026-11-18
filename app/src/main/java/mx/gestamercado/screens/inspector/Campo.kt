@@ -35,9 +35,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import androidx.compose.ui.platform.LocalContext
 import mx.gestamercado.LocalApp
 import mx.gestamercado.LocalNav
 import mx.gestamercado.LocalToast
+import mx.gestamercado.api.TipoIncidencia
+import mx.gestamercado.data.Gps
 import mx.gestamercado.ui.*
 import mx.gestamercado.util.*
 import kotlin.math.abs
@@ -45,47 +48,57 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.random.Random
 
-/** Vista 1.4.A · Formulario de asistencia / acta de ausencia. */
+/** Vista M-I2 · Pase de lista GPS (POST /api/v1/asistencias) con acta de ausencia. */
 @Composable
 fun AsistenciaScreen(localId: String) {
     val app = LocalApp.current
     val nav = LocalNav.current
     val toast = LocalToast.current
+    val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val l = app.local(localId)
+    var ubicacion by remember { mutableStateOf(Gps.posicion(ctx, app.simulado)) }
     var tipo by remember { mutableIntStateOf(1) }
     var obs by remember { mutableStateOf("Cortina metálica abajo con candado. Sin mercancía visible.") }
     var foto by remember { mutableStateOf<String?>(null) }
     var sha by remember { mutableStateOf("") }
     var capturing by remember { mutableStateOf(false) }
     var dialogo by remember { mutableIntStateOf(0) }
-    val tipos = listOf("Asistencia operativa", "Local cerrado / ausencia", "Negativa de pago")
+    val tipos = listOf("Presente · asistencia operativa", "Ausente · local cerrado", "Negativa de pago")
+    val tiposApi = listOf(TipoIncidencia.PRESENTE, TipoIncidencia.AUSENTE_CERRADO, TipoIncidencia.NEGATIVA_PAGO)
     val actas = app.actas[l.id] ?: 0
     val siguiente = if (tipo == 0) actas else actas + 1
 
     fun guardar() {
+        val gps = ubicacion ?: Gps.posicion(ctx, app.simulado).also { ubicacion = it }
+        if (gps == null) { toast("Sin señal GPS: activa la ubicación. La coordenada es obligatoria en el pase de lista."); return }
         if (tipo != 0 && foto == null) { toast("La foto del local es obligatoria para un acta de ausencia o negativa."); return }
+        try {
+            app.registrarAsistencia(l.id, tiposApi[tipo], obs, gps)
+        } catch (e: IllegalStateException) {
+            toast(e.message ?: "No se pudo registrar."); return
+        }
+        val sufijo = if (app.online) "" else " Se enviará al recuperar señal."
         if (tipo == 0) {
-            app.registrarAsistencia(l.id)
             nav.pop()
-            toast("Asistencia de ${l.id} registrada para cobro POR_VISITA.")
+            toast("Asistencia PRESENTE de ${l.id} registrada.$sufijo")
             return
         }
-        val n = app.registrarActa(l.id)
+        val n = app.actas[l.id] ?: 0
         if (n >= 3) dialogo = n else {
             nav.pop()
-            toast("Acta guardada con evidencia FOTO_LOCAL · ${l.id} lleva $n de 3.")
+            toast("${tiposApi[tipo].name} · ${l.id} lleva $n de 3 actas.$sufijo")
         }
     }
 
     Column(Modifier.fillMaxSize()) {
-        InspectorBar("${l.id} · ${fDia(app.hoy).uppercase()} · INSP. 3f9a…c21", "Registro de asistencia", back = true)
+        InspectorBar("${l.id} · ${fDia(app.hoy).uppercase()} · INSP. ${corto(app.usuarioId)}", "Pase de lista", back = true)
         Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(16.dp)) {
             Text(l.nombre, style = sans(18, FontWeight.ExtraBold, ls = -0.3))
             VSpace(3)
             Text("Titular: ${l.titular}", style = sans(12.5, color = C.Muted2))
             VSpace(16)
-            Text("TIPO DE REGISTRO", style = label())
+            Text("RESULTADO DE VISITA · tipoIncidencia", style = label())
             VSpace(6)
             BoxCard {
                 tipos.forEachIndexed { i, t ->
@@ -102,7 +115,20 @@ fun AsistenciaScreen(localId: String) {
                 }
             }
             VSpace(14)
-            BoxField("OBSERVACIONES", obs, { obs = it }, minLines = 3)
+            BoxField("NOTAS DEL INSPECTOR · observaciones", obs, { obs = it }, minLines = 3)
+            VSpace(14)
+            Text("UBICACIÓN GPS · OBLIGATORIA", style = label())
+            VSpace(6)
+            BoxCard(padding = PaddingValues(12.dp, 10.dp), onClick = { ubicacion = Gps.posicion(ctx, app.simulado) }) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Diamond(9.dp, if (ubicacion != null) C.Teal else C.Magenta)
+                    HSpace(9)
+                    Column(Modifier.weight(1f)) {
+                        Text(Gps.texto(ubicacion), style = mono(12.5, color = if (ubicacion != null) C.Ink else C.Magenta))
+                        Text("fecha ${app.hoy} · toca para actualizar", style = sans(11, color = C.Muted2))
+                    }
+                }
+            }
             VSpace(14)
             Row {
                 Text(if (tipo == 0) "FOTO_LOCAL · OPCIONAL" else "FOTO_LOCAL · OBLIGATORIA", style = label(), modifier = Modifier.weight(1f))
@@ -135,7 +161,7 @@ fun AsistenciaScreen(localId: String) {
                             VSpace(4)
                             Text("image/jpeg · 1.8 MB", style = mono(11, color = C.Body))
                             Text("sha256 ${corto(sha)}", style = mono(11, color = C.Body))
-                            Text("EXIF GPS 19.04152, −98.20611", style = mono(11, color = C.TealDark))
+                            Text("EXIF GPS ${Gps.texto(ubicacion)}", style = mono(11, color = C.TealDark))
                             VSpace(4)
                             Text("Toca para repetir", style = sans(11, color = C.Muted2))
                         }

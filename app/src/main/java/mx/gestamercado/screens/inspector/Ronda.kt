@@ -22,11 +22,16 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.ui.platform.LocalContext
 import kotlinx.coroutines.delay
 import mx.gestamercado.LocalApp
 import mx.gestamercado.LocalNav
 import mx.gestamercado.Route
+import mx.gestamercado.data.Gps
 import mx.gestamercado.data.LocalStatus
+import mx.gestamercado.util.fDia
 import mx.gestamercado.ui.*
 import mx.gestamercado.util.f2
 import mx.gestamercado.util.money
@@ -34,6 +39,10 @@ import mx.gestamercado.util.money
 @Composable
 fun InspectorShell() {
     val app = LocalApp.current
+    val ctx = LocalContext.current
+    // La ubicación es obligatoria en el pase de lista y recomendada en el cobro (GeoJSON Point).
+    val permiso = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
+    LaunchedEffect(Unit) { if (!Gps.tienePermiso(ctx)) permiso.launch(Gps.PERMISOS) }
     Column(Modifier.fillMaxSize()) {
         Box(Modifier.weight(1f)) {
             when (app.inspTab) {
@@ -77,7 +86,10 @@ fun MapaScreen() {
     )
 
     Column(Modifier.fillMaxSize()) {
-        InspectorBar("MERCADO PONIENTE · MP-01", "Ronda de cobro", actions = { BarAction("+ Alta") { nav.push(Route.AltaLocal) } })
+        InspectorBar(app.mercadoNombre.uppercase(), "Ronda de cobro", actions = {
+            BarAction("+ Feria") { nav.push(Route.Feria()) }
+            BarAction("+ Alta") { nav.push(Route.AltaLocal) }
+        })
         Column(Modifier.fillMaxWidth().borderBottom().padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 12.dp)) {
             OutlinedTextField(
                 value = q,
@@ -102,17 +114,20 @@ fun MapaScreen() {
         BoxWithConstraints(Modifier.weight(1f).fillMaxWidth().background(C.Sand)) {
             val k = maxWidth.value / 386f
             Box(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-                Box(Modifier.fillMaxWidth().height((470 * k).dp)) {
-                    Box(Modifier.offset((12 * k).dp, (16 * k).dp).size((362 * k).dp, (400 * k).dp).background(C.Bg).border(2.dp, C.Ink))
-                    listOf("PASILLO A · TORTILLAS Y MASA" to 28f, "PASILLO B · ABARROTES" to 154f, "PASILLO C · FRUTAS Y LEGUMBRES" to 280f).forEach { (t, y) ->
+                val filas = ((app.locales.size + 5) / 6).coerceAtLeast(1)
+                Box(Modifier.fillMaxWidth().height(((70 + filas * 126) * k).dp)) {
+                    Box(Modifier.offset((12 * k).dp, (16 * k).dp).size((362 * k).dp, ((filas * 126 + 22) * k).dp).background(C.Bg).border(2.dp, C.Ink))
+                    val pasillos = app.locales.chunked(6).mapIndexed { i, fila -> fila.first().zona.uppercase() to (28f + i * 126f) }.distinctBy { it.first }
+                    pasillos.forEach { (t, y) ->
                         Text(t, style = label(C.Muted2, 9.5 * k), modifier = Modifier.offset((24 * k).dp, (y * k).dp))
                     }
                     app.locales.forEach { l ->
                         val s = app.statusDe(l)
+                        val feria = l.esFeria
                         val match = filtro == null || filtro == s
                         Box(
                             Modifier.offset((l.x * k).dp, (l.y * k).dp).size((50 * k).dp, (70 * k).dp).alpha(if (match) 1f else 0.22f)
-                                .background(statusBg(s)).border(1.5.dp, C.Ink).clickable { sheet = l.id }.padding((5 * k).dp),
+                                .background(statusBg(s)).border(if (feria) 1.dp else 1.5.dp, C.Ink).clickable { sheet = l.id }.padding((5 * k).dp),
                             contentAlignment = Alignment.BottomStart,
                         ) {
                             Text(l.id, style = mono(10 * k, FontWeight.Medium, statusFg(s)))
@@ -200,6 +215,7 @@ fun LocalSheet(localId: String, onDismiss: () -> Unit) {
     val s = app.statusDe(l)
     val adeudo = app.adeudo(l.id)
     val des = l.base == LocalStatus.DESOCUPADO
+    val permiso = app.permisoVigente(l.id)
     val state = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
     ModalBottomSheet(
@@ -233,7 +249,7 @@ fun LocalSheet(localId: String, onDismiss: () -> Unit) {
                     VLine()
                     MetricCell("VENCIDOS", "${app.vencidos(l.id)} cargos", Modifier.weight(1f).fillMaxHeight())
                     VLine()
-                    MetricCell("A FAVOR", money(0.0), Modifier.weight(1f).fillMaxHeight())
+                    MetricCell("A FAVOR", money(app.saldoFavor(l.id)), Modifier.weight(1f).fillMaxHeight())
                 }
             }
             Column(Modifier.padding(18.dp, 14.dp)) {
@@ -279,14 +295,30 @@ fun LocalSheet(localId: String, onDismiss: () -> Unit) {
                 }
             }
             Column(Modifier.padding(start = 18.dp, end = 18.dp, bottom = 18.dp)) {
-                PrimaryButton(
-                    if (des) "Local sin concesión" else "Realizar cobro",
-                    if (des) null else ({ onDismiss(); nav.push(Route.Cobro(l.id)) }),
-                    arrow = !des,
-                )
+                if (permiso != null) {
+                    Notice("${permiso.titular} · ${permiso.giro} · ${fDia(permiso.inicio)} – ${fDia(permiso.fin)} · folio ${permiso.folio}", "PERMISO DE FERIA VIGENTE", Tone.OK)
+                    VSpace(10)
+                }
+                if (app.jornadaCerrada) {
+                    Notice("La jornada ya se cerró con el corte ciego: no se pueden registrar más cobros hoy.", tone = Tone.WARN)
+                    VSpace(10)
+                }
+                when {
+                    des && permiso == null -> PrimaryButton(
+                        "Expedir permiso de feria",
+                        if (app.jornadaCerrada) null else ({ onDismiss(); nav.push(Route.Feria(l.id)) }),
+                        color = C.TealDark, arrow = true,
+                    )
+                    des -> PrimaryButton("Espacio con permiso vigente", null)
+                    else -> PrimaryButton(
+                        "Realizar cobro",
+                        if (app.jornadaCerrada) null else ({ onDismiss(); nav.push(Route.Cobro(l.id)) }),
+                        arrow = true,
+                    )
+                }
                 VSpace(8)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    GhostButton("Registrar incidencia", { onDismiss(); nav.push(Route.Asistencia(l.id)) }, Modifier.weight(1f))
+                    GhostButton("Pase de lista", if (des) null else ({ onDismiss(); nav.push(Route.Asistencia(l.id)) }), Modifier.weight(1f))
                     GhostButton("Historial de pagos", { onDismiss(); nav.push(Route.Historial(l.id)) }, Modifier.weight(1f))
                 }
             }

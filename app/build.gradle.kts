@@ -12,11 +12,20 @@ android {
         applicationId = "mx.gestamercado"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
+        // URL del backend Spring Boot. Vacía = modo simulado (datos en memoria).
+        // Ejemplo: ./gradlew assembleDebug -PgestaApiUrl=http://10.0.2.2:8080
+        val apiUrl = (project.findProperty("gestaApiUrl") as String?) ?: ""
+        buildConfigField("String", "API_URL", "\"$apiUrl\"")
+        manifestPlaceholders["usesCleartext"] = "false"
     }
 
     buildTypes {
+        debug {
+            // Permite http:// hacia un backend local durante el desarrollo.
+            manifestPlaceholders["usesCleartext"] = "true"
+        }
         release {
             isMinifyEnabled = false
             // Firma con la clave de depuración para poder instalar el APK directamente.
@@ -33,6 +42,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 
@@ -49,4 +59,5 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     debugImplementation("androidx.compose.ui:ui-tooling")
     implementation("com.google.zxing:core:3.5.3")
+    testImplementation("junit:junit:4.13.2")
 }

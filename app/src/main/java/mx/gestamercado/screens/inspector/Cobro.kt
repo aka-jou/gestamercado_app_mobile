@@ -19,22 +19,36 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.ui.platform.LocalContext
 import mx.gestamercado.LocalApp
+import mx.gestamercado.LocalBackend
 import mx.gestamercado.LocalNav
 import mx.gestamercado.LocalToast
 import mx.gestamercado.Route
+import mx.gestamercado.api.FormaPago
 import mx.gestamercado.data.Aplicacion
+import mx.gestamercado.data.Documentos
+import mx.gestamercado.data.Gps
+import mx.gestamercado.data.Remoto
 import mx.gestamercado.data.SyncState
+import java.time.LocalDate
 import mx.gestamercado.ui.*
 import mx.gestamercado.util.*
 
-/** Vista 1.3.A · Pantalla de liquidación y captura de cobro (FIFO). */
+/** Vista M-I3 · Cobro en campo offline-first con firma HMAC-SHA256 (POST /api/v1/cobranza/campo). */
 @Composable
 fun CobroScreen(localId: String) {
     val app = LocalApp.current
     val nav = LocalNav.current
+    val toast = LocalToast.current
+    val backend = LocalBackend.current
+    val ctx = LocalContext.current
     val focus = LocalFocusManager.current
+    LaunchedEffect(localId) { runCatching { Remoto.cargarCuenta(app, backend, localId) } }
     val l = app.local(localId)
+    var ubicacion by remember { mutableStateOf(Gps.posicion(ctx, app.simulado)) }
+    var dirigido by remember { mutableStateOf<LocalDate?>(null) }
     val yaGenerado = app.generadoHoy(l.id)
     var unidades by remember { mutableIntStateOf(if (yaGenerado) 0 else 1) }
     var montoTxt by remember {
@@ -44,10 +58,11 @@ fun CobroScreen(localId: String) {
     var forma by remember { mutableIntStateOf(0) }
     val pagadores = listOf("${l.titular} · TITULAR") + l.suplentes.map { "${it.nombre} · ${it.parentesco}" }
     var pagador by remember { mutableIntStateOf(if (l.suplentes.isNotEmpty()) 1 else 0) }
-    val formas = listOf("EFECTIVO", "TRANSFERENCIA", "TARJETA")
+    val formas = FormaPago.entries
     val monto = montoTxt.replace(",", "").replace("\$", "").trim().toDoubleOrNull() ?: 0.0
-    val previa = app.simular(l.id, monto, unidades)
-    val pend = app.cargosDe(l.id).filter { it.saldo > 0 }
+    val previa = app.simular(l.id, monto, unidades, dirigido)
+    val pend = app.cargosDe(l.id).let { c -> if (dirigido == null) c else c.sortedBy { if (it.inicio == dirigido) 0 else 1 } }.filter { it.saldo > 0 }
+    val elegibles = app.cargosDe(l.id).filter { it.saldo > 0 && it.inicio != null }
 
     Column(Modifier.fillMaxSize()) {
         InspectorBar("COBRO · ${l.id} · ${l.tarjeton}", l.nombre, back = true)
@@ -71,8 +86,17 @@ fun CobroScreen(localId: String) {
                     }
                 }
             }
+            if (elegibles.isNotEmpty()) {
+                VSpace(14)
+                Text("CARGO A CUBRIR PRIMERO · fechaInicioCargo", style = label())
+                VSpace(6)
+                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    SelectChip("FIFO", dirigido == null) { dirigido = null }
+                    elegibles.forEach { c -> SelectChip("#${c.id} · ${fDia(c.inicio!!)}", dirigido == c.inicio) { dirigido = c.inicio } }
+                }
+            }
             VSpace(18)
-            SectionTitle("PASIVOS · FIFO")
+            SectionTitle(if (dirigido == null) "PASIVOS · FIFO" else "PASIVOS · AMORTIZACIÓN DIRIGIDA")
             VSpace(10)
             if (pend.isEmpty() && (unidades == 0 || yaGenerado)) {
                 Notice("Sin cargos pendientes. Cualquier monto irá a saldo a favor.", tone = Tone.OK)
@@ -141,6 +165,17 @@ fun CobroScreen(localId: String) {
                     }
                 }
             }
+            VSpace(14)
+            Text("UBICACIÓN GPS DEL COBRO", style = label())
+            VSpace(6)
+            BoxCard(padding = PaddingValues(12.dp, 10.dp), onClick = { ubicacion = Gps.posicion(ctx, app.simulado) }) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Diamond(9.dp, if (ubicacion != null) C.Teal else C.Yellow)
+                    HSpace(9)
+                    Text(if (ubicacion != null) Gps.texto(ubicacion) else "Sin señal GPS · el cobro se marcará para revisión", style = mono(12, color = if (ubicacion != null) C.Ink else C.YellowText), modifier = Modifier.weight(1f))
+                    Text("Actualizar", style = sans(11.5, FontWeight.Bold, C.TealDark))
+                }
+            }
             VSpace(16)
             Column(Modifier.fillMaxWidth().background(C.Ink).padding(16.dp, 14.dp)) {
                 Text("PREVISUALIZACIÓN · pago_detalle", style = label(C.Muted))
@@ -161,10 +196,18 @@ fun CobroScreen(localId: String) {
                 }
             }
             VSpace(16)
-            PrimaryButton("Confirmar cobro", if (monto > 0) ({
+            val t = app.terminal
+            if (t == null) Notice("La terminal no está enrolada: configúrala desde el inicio de sesión.", tone = Tone.DANGER)
+            else Text("Folio ${mx.gestamercado.api.Firma.folio(t.serieFolio, app.consecutivo)} · se firma con HMAC-SHA256 de la terminal", style = mono(11, color = C.Muted2))
+            VSpace(10)
+            PrimaryButton("Confirmar cobro", if (monto >= 0.01 && t != null && !app.jornadaCerrada) ({
                 focus.clearFocus()
-                val p = app.cobrar(l, round2(monto), unidades, formas[forma], pagadores[pagador])
-                nav.replace(Route.Comprobante(p.folio))
+                try {
+                    val p = app.cobrar(l, round2(monto), unidades, formas[forma], pagadores[pagador], ubicacion, dirigido)
+                    nav.replace(Route.Comprobante(p.folio))
+                } catch (e: IllegalStateException) {
+                    toast(e.message ?: "No se pudo registrar el cobro.")
+                }
             }) else null, amount = money(monto))
             VSpace(8)
         }
@@ -213,7 +256,12 @@ fun ComprobanteScreen(folio: String, locatario: Boolean) {
     val app = LocalApp.current
     val nav = LocalNav.current
     val toast = LocalToast.current
+    val backend = LocalBackend.current
+    val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
+    fun pdf(compartir: Boolean) = scope.launch {
+        runCatching { Documentos.recibo(ctx, app, backend, app.pago(folio), compartir) }.onFailure { toast(it.message ?: "No se pudo obtener el PDF.") }
+    }
     val p = app.pago(folio)
     val l = app.local(p.localId)
     var printing by remember { mutableStateOf(false) }
@@ -251,12 +299,13 @@ fun ComprobanteScreen(folio: String, locatario: Boolean) {
                     HSpace(10)
                     Column {
                         Text("H. Ayuntamiento de Santa Lucía", style = sans(13, FontWeight.Bold))
-                        Text("Mercado Poniente · MP-01", style = sans(11, color = C.Muted2))
+                        Text(app.mercadoNombre, style = sans(11, color = C.Muted2))
                     }
                 }
                 VSpace(12); DashedLine(); VSpace(12)
                 R("FOLIO", p.folio)
-                R("UUID", corto(p.uuid, 8, 4))
+                R("PAGO ID", corto(p.uuid, 8, 4))
+                if (!locatario && p.dispositivoId != null) R("TERMINAL", corto(p.dispositivoId, 8, 4))
                 R("LOCAL", fTicket(p.fecha))
                 R("UTC", fTicket(p.fecha.plusHours(6)))
                 if (locatario) {
@@ -266,7 +315,9 @@ fun ComprobanteScreen(folio: String, locatario: Boolean) {
                 VSpace(7); DashedLine(); VSpace(12)
                 Text("${l.id} · ${l.nombre}", style = mono(11.5, FontWeight.Medium))
                 VSpace(4)
-                listOf("Titular: ${l.titular}", "Giro: ${l.giroAutorizado}", "Art. 31 Fr. I Ley de Ingresos 2026", "UMA ${money(UMA)} · ${f2(l.area)} m²").forEach {
+                val permiso = p.permiso
+                (if (permiso != null) listOf("Feriante: ${permiso.titular}", "Giro: ${permiso.giro}", "Permiso: ${fDia(permiso.inicio)} – ${fDia(permiso.fin)}", "Feria express · ${f2(l.area)} m²")
+                else listOf("Titular: ${l.titular}", "Giro: ${l.giroAutorizado}", "Art. 31 Fr. I Ley de Ingresos 2026", "UMA ${money(UMA)} · ${f2(l.area)} m²")).forEach {
                     Text(it, style = mono(11.5, color = C.Body))
                 }
                 VSpace(12); DashedLine(); VSpace(12)
@@ -289,7 +340,7 @@ fun ComprobanteScreen(folio: String, locatario: Boolean) {
                     QrCode("${p.uuid}|${p.folio}|${f2(p.monto)}|${p.hash}", 100.dp)
                     HSpace(12)
                     Column(Modifier.weight(1f)) {
-                        Text(if (locatario) "SELLO SHA-256" else "HASH_OFFLINE · SHA-256", style = label(size = 9.5))
+                        Text(if (locatario) "SELLO" else "HASH_OFFLINE · HMAC-SHA256", style = label(size = 9.5))
                         VSpace(4)
                         Text(if (locatario) p.hash else "${p.hash.take(10)}…${p.hash.takeLast(8)}", style = mono(10, color = C.Body, lh = 1.4))
                         VSpace(8)
@@ -301,7 +352,11 @@ fun ComprobanteScreen(folio: String, locatario: Boolean) {
             }
             VSpace(12)
             if (locatario) Notice("Autenticidad verificable al escanear el QR", tone = Tone.OK)
-            else Notice(if (p.gps) "GPS capturado · 19.04141, −98.20634 · ±6 m" else "Cobro sin señal GPS: se marcará para revisión.", tone = if (p.gps) Tone.OK else Tone.WARN)
+            else Notice(if (p.gps) "GPS capturado · ${if (p.ubicacion != null) Gps.texto(p.ubicacion) else "19.04141, −98.20634 · ±6 m"}" else "Cobro sin señal GPS: se marcará para revisión.", tone = if (p.gps) Tone.OK else Tone.WARN)
+            if (!locatario && p.revision != null) {
+                VSpace(8)
+                Notice(p.revision!!, "REQUIERE REVISIÓN", Tone.DANGER)
+            }
             if (!locatario && p.sync == SyncState.EN_COLA) {
                 VSpace(8)
                 Notice("Guardado en el teléfono. Se subirá al recuperar señal (${app.pendientes} en cola).", tone = Tone.WARN)
@@ -309,15 +364,15 @@ fun ComprobanteScreen(folio: String, locatario: Boolean) {
         }
         Column(Modifier.navigationBarsPadding().padding(start = 22.dp, end = 22.dp, top = 4.dp, bottom = 16.dp)) {
             if (locatario) {
-                PrimaryButton("Descargar comprobante PDF", { toast("Comprobante ${p.folio}.pdf guardado en Descargas.") })
+                PrimaryButton("Recibo oficial PDF con QR", { pdf(false) })
                 VSpace(8)
-                GhostButton("Compartir comprobante", { toast("Abriendo opciones para compartir…") }, fill = Color.White)
+                GhostButton("Compartir recibo", { pdf(true) }, fill = Color.White)
             } else {
                 PrimaryButton(if (printing) "Imprimiendo…" else "Imprimir ticket Bluetooth", if (printing) null else ({ imprimir(false) }))
                 VSpace(8)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     GhostButton("Reimprimir", if (printing) null else ({ imprimir(true) }), Modifier.weight(1f), fill = Color.White)
-                    GhostButton("PDF / WhatsApp", { toast("Generando PDF para compartir por WhatsApp…") }, Modifier.weight(1f), fill = Color.White)
+                    GhostButton("PDF / WhatsApp", { pdf(true) }, Modifier.weight(1f), fill = Color.White)
                 }
                 TextButton(onClick = { nav.pop() }, modifier = Modifier.fillMaxWidth()) {
                     Text("Volver a la ronda", style = sans(14, FontWeight.Bold, C.TealDark))
